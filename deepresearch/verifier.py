@@ -23,6 +23,29 @@ load_dotenv()
 PROMPT_PATH = Path(__file__).parent / "prompts" / "verifier.txt"
 MAX_CONCURRENT = 5
 
+# USD per 1M tokens, keyed by model name substring.
+# Update entries here when adding new models via llm.py routing.
+MODEL_PRICING = {
+    "gpt-4o":           (2.50, 10.00),
+    "gpt-4o-mini":      (0.15,  0.60),
+    "claude-sonnet":    (3.00, 15.00),
+    "claude-haiku":     (1.00,  5.00),
+    "deepseek-chat":    (0.27,  1.10),
+    "deepseek-reasoner": (0.55, 2.19),
+    "glm-4":            (0.14,  0.14),
+    "qwen-max":         (1.40,  5.60),
+}
+DEFAULT_PRICING = (2.50, 10.00)  # fallback when model name doesn't match
+
+
+def _estimate_cost(model_name: str, n_input_tokens: int, n_output_tokens: int) -> float:
+    """Estimate USD cost for an LLM call by matching model name prefix."""
+    for key, (in_rate, out_rate) in MODEL_PRICING.items():
+        if key in (model_name or "").lower():
+            return n_input_tokens * in_rate / 1e6 + n_output_tokens * out_rate / 1e6
+    in_rate, out_rate = DEFAULT_PRICING
+    return n_input_tokens * in_rate / 1e6 + n_output_tokens * out_rate / 1e6
+
 
 def _load_prompt() -> str:
     return PROMPT_PATH.read_text(encoding="utf-8")
@@ -162,13 +185,18 @@ async def verify_report(report: ResearchReport) -> ResearchReport:
     total = len(verified_claims)
     elapsed = time.time() - start_time
 
-    # Rough cost estimate: each claim ~500 tokens in/out
-    est_input_tokens = total * 500
-    est_output_tokens = total * 100
-    cost = (
-        est_input_tokens * 2.5 / 1_000_000
-        + est_output_tokens * 10 / 1_000_000
-    )
+    # Cost estimate via model-name-keyed pricing table (see MODEL_PRICING).
+    # Two-pass verification roughly doubles tokens for contradicted claims.
+    contradicted_count = labels.get("contradicted", 0)
+    base_calls = total
+    extra_calls = contradicted_count  # second-pass review
+    est_input_tokens = (base_calls + extra_calls) * 500
+    est_output_tokens = (base_calls + extra_calls) * 100
+
+    from .llm import get_model
+
+    verifier_model = get_model("verifier")
+    cost = _estimate_cost(verifier_model, est_input_tokens, est_output_tokens)
 
     report.verifier_summary = {
         "total": total,
