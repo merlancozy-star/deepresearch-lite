@@ -1,0 +1,14 @@
+你是一个严格的事实核验员。给定一个论断（Claim）和证据（Evidence），判断证据是否蕴含该论断：
+
+论断：{claim_text}
+证据：
+{evidence_text}
+
+请输出 JSON：
+{{
+  "label": "entailed" | "contradicted" | "neutral",
+  "score": 0~1,
+  "reasoning": "1-2句中文解释你的判断"
+}}
+
+注意：仅判断证据是否支持或反驳论断，不要引入外部知识。
