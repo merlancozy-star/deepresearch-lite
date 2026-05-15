@@ -36,12 +36,51 @@ def _build_evidence_text(claim: Claim) -> str:
     return "\n\n".join(parts)
 
 
+def _verify_single(claim: Claim, evidence: str, review_pass: int = 1) -> dict:
+    """Run a single NLI verification pass. Returns parsed JSON result."""
+    prompt_template = _load_prompt()
+    prompt = prompt_template.format(
+        claim_text=claim.text,
+        evidence_text=evidence,
+    )
+
+    from .llm import get_model
+
+    client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        base_url=os.getenv("OPENAI_BASE_URL"),
+        timeout=60.0,
+    )
+    model = get_model("verifier")
+
+    system_msg = "你是一个严格的事实核验员。只输出 JSON。"
+    if review_pass == 2:
+        system_msg += " 这是二次复核。请特别谨慎：只有在证据与论断存在明确、不可调和的矛盾时，才判 contradicted。如果有任何合理的解释角度使论断可能成立，请判 neutral。只输出 JSON。"
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+        )
+        content = response.choices[0].message.content or "{}"
+        return json.loads(content)
+    except Exception:
+        return {}
+
+
 def verify_claim(claim: Claim) -> Claim:
-    """Verify a single claim against its citations using an NLI prompt.
+    """Verify a single claim against its citations using a two-pass NLI prompt.
+
+    First pass: standard NLI classification.
+    Second pass (only if contradicted): stricter review to reduce false positives.
 
     Returns the same Claim object with verifier_* fields populated.
     """
-    prompt_template = _load_prompt()
     evidence = _build_evidence_text(claim)
 
     if not evidence.strip():
@@ -50,36 +89,32 @@ def verify_claim(claim: Claim) -> Claim:
         claim.verifier_reasoning = "No evidence provided to verify."
         return claim
 
-    prompt = prompt_template.format(
-        claim_text=claim.text,
-        evidence_text=evidence,
-    )
+    # First pass
+    result = _verify_single(claim, evidence, review_pass=1)
 
-    client = OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_BASE_URL"),
-        timeout=60.0,
-    )
-    model = os.getenv("OPENAI_MODEL", "gpt-4o")
+    label = result.get("label", "unchecked")
+    score = float(result.get("score", 0))
+    reasoning = result.get("reasoning", "核验失败。")
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "你是一个严格的事实核验员。只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-        )
-        content = response.choices[0].message.content or "{}"
-        result = json.loads(content)
-    except Exception:
-        result = {}
+    # Second pass: if contradicted, re-verify with a higher bar
+    if label == "contradicted":
+        result2 = _verify_single(claim, evidence, review_pass=2)
+        label2 = result2.get("label", label)
+        score2 = float(result2.get("score", score))
+        reasoning2 = result2.get("reasoning", reasoning)
 
-    claim.verifier_label = result.get("label", "unchecked")
-    claim.verifier_score = float(result.get("score", 0))
-    claim.verifier_reasoning = result.get("reasoning", "核验失败。")
+        if label2 != "contradicted":
+            # Second pass overturned the contradiction
+            label = label2
+            score = score2
+            reasoning = f"[复核后修正] {reasoning2}"
+        else:
+            # Confirmed contradiction — use second pass reasoning
+            reasoning = f"[二次复核确认] {reasoning2}"
+
+    claim.verifier_label = label
+    claim.verifier_score = score
+    claim.verifier_reasoning = reasoning
 
     return claim
 

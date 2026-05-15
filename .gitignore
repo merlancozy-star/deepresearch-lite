@@ -21,6 +21,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# Cache (SQLite query cache)
+.cache/
+
 # Reports (generated output)
 reports/*.md
 reports/*.json

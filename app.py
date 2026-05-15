@@ -145,6 +145,7 @@ if submit and query.strip():
                     ("classify", "意图分类"),
                     ("search", "搜索阶段"),
                     ("fuse", "RRF 融合"),
+                    ("reflect", "反思补充搜索"),
                     ("synthesize", "报告撰写"),
                     ("verify", "NLI 核验"),
                 ]:

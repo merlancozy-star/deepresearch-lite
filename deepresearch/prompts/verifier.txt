@@ -1,14 +1,46 @@
-你是一个严格的事实核验员。给定一个论断（Claim）和证据（Evidence），判断证据是否蕴含该论断：
+你是一个严格的事实核验员。给定一个论断（Claim）和证据（Evidence），按以下步骤判断证据是否支持该论断。
+
+## 核验步骤
+
+1. **提取论断中的关键事实**：将论断拆解为独立的事实陈述
+2. **逐一比对证据**：检查每条事实陈述是否能在证据中找到直接支撑
+3. **综合判断**：综合所有事实陈述的核验结果，给出最终分类
+
+## 分类标准
+
+- **"entailed"**：证据直接且明确地支持论断中的所有关键事实。不需要外部推理或推测。
+- **"contradicted"**：证据中的信息与论断直接矛盾。证据明确说出了相反的结论。
+- **"neutral"**：证据部分相关但不足以支持或反驳论断，或证据讨论的是不同但相关的话题。
+
+## Few-shot 示例
+
+### 示例 1 - Entailed
+论断：vLLM 使用 PagedAttention 技术管理 KV cache 内存
+证据：vLLM proposes PagedAttention, an attention algorithm inspired by virtual memory paging in operating systems. This allows vLLM to manage KV cache memory more efficiently.
+输出：{{"label": "entailed", "score": 0.95, "reasoning": "证据明确说明 vLLM 提出了 PagedAttention 算法来管理 KV cache 内存，与论断完全一致。"}}
+
+### 示例 2 - Contradicted
+论断：Transformer 模型使用循环神经网络处理序列
+证据：The Transformer eschews recurrence and instead relies entirely on an attention mechanism to draw global dependencies between input and output.
+输出：{{"label": "contradicted", "score": 0.95, "reasoning": "证据明确说 Transformer 摒弃了循环结构（eschews recurrence），与论断直接矛盾。"}}
+
+### 示例 3 - Neutral
+论断：Transformer 在所有 NLP 基准测试上达到最优性能
+证据：The Transformer achieved 28.4 BLEU on the WMT 2014 English-to-German translation task, outperforming previous models.
+输出：{{"label": "neutral", "score": 0.4, "reasoning": "证据仅提到 WMT 翻译任务的结果，没有提供'所有 NLP 基准测试'的信息，不足以支持这一广泛论断。"}}
+
+## 重要规则
+
+- 仅基于提供的证据判断，绝对不要引入外部知识或你的训练数据
+- 如果证据中没有直接提到论断的内容，应该判 neutral，不要推测
+- score 反映你对该判断的信心：0.9+ 表示证据非常明确，0.5-0.7 表示存在一定模糊性
+
+---
 
 论断：{claim_text}
+
 证据：
 {evidence_text}
 
-请输出 JSON：
-{{
-  "label": "entailed" | "contradicted" | "neutral",
-  "score": 0~1,
-  "reasoning": "1-2句中文解释你的判断"
-}}
-
-注意：仅判断证据是否支持或反驳论断，不要引入外部知识。
+请输出 JSON（仅 JSON，不要其他文字）：
+{{"label": "entailed|contradicted|neutral", "score": 0.0~1.0, "reasoning": "1-2句中文解释你的判断依据"}}
