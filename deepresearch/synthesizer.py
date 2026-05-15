@@ -135,6 +135,7 @@ def synthesize(
             claim_text = rc.get("text", "")
             source_ids = rc.get("source_ids", [])
             chunk_ids = rc.get("chunk_ids", [])
+            section = rc.get("section", "")
 
             matched_citations: List[Citation] = []
             for sid in source_ids:
@@ -172,6 +173,7 @@ def synthesize(
 
             claims.append(Claim(
                 text=claim_text,
+                section=section,
                 citations=matched_citations,
             ))
 
@@ -187,13 +189,18 @@ def synthesize(
             )
 
         markdown = data.get("markdown", "")
+        references = data.get("references", [])
+        methodology = data.get("methodology", "")
         elapsed = time.time() - start_time
 
         return ResearchReport(
             query=query,
             intent=intent,  # type: ignore
+            sub_questions=sub_questions,
             claims=claims,
+            references=references,
             markdown=markdown,
+            methodology=methodology,
             cost_usd=round(total_cost, 6),
             elapsed_seconds=round(elapsed, 2),
         )
@@ -203,8 +210,11 @@ def synthesize(
     return ResearchReport(
         query=query,
         intent=intent,  # type: ignore
+        sub_questions=sub_questions,
         claims=claims,
+        references=data.get("references", []),
         markdown=data.get("markdown", "# Report\n\nSynthesis incomplete after retries."),
+        methodology=data.get("methodology", ""),
         cost_usd=round(total_cost, 6),
         elapsed_seconds=round(elapsed, 2),
     )
