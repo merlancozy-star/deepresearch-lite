@@ -1,7 +1,8 @@
-"""Research graph pipeline: orchestrates the full research flow.
+"""Research graph pipeline: LangGraph StateGraph orchestration.
 
-Flow: classify → decompose → search → fuse → reflect → synthesize → verify
-Each node is independently callable (for future MCP Server exposure).
+Flow: classify → search → fuse → reflect → synthesize → verify
+Each node is a callable function operating on a shared ResearchState.
+The graph is compiled once at module load and reused across requests.
 """
 from __future__ import annotations
 
@@ -10,14 +11,15 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, TypedDict
 
 from dotenv import load_dotenv
+from langgraph.graph import END, START, StateGraph
 from openai import OpenAI
 
 from .citation import rrf_fusion
 from .orchestrator import classify_intent, decompose_query
-from .schemas import Citation, Claim, ResearchReport
+from .schemas import Citation, ResearchReport
 from .subagents.arxiv import ArxivSubagent
 from .subagents.mock import MockSubagent
 from .subagents.web import WebSubagent
@@ -29,16 +31,112 @@ load_dotenv()
 REFLECTOR_PROMPT_PATH = Path(__file__).parent / "prompts" / "reflector.txt"
 
 
-async def _reflect_and_search(
-    query: str,
-    sub_questions: List[str],
-    citation_pool: List[Citation],
-) -> List[Citation]:
-    """Step 3.5: Review collected evidence for gaps, execute supplementary searches.
+# ── State ────────────────────────────────────────────────────────────────────
 
-    Returns an augmented citation pool.
-    """
-    # Build a compact evidence summary
+class ResearchState(TypedDict, total=False):
+    query: str
+    intent: str
+    sub_questions: List[str]
+    citation_pool: List[Citation]
+    report: ResearchReport
+    stats: Dict[str, float]
+    error: str
+
+
+# ── Node functions ───────────────────────────────────────────────────────────
+
+async def _classify_node(state: ResearchState) -> dict:
+    """Step 1: Intent classification + query decomposition."""
+    t0 = time.time()
+    query = state["query"]
+
+    intent = classify_intent(query)
+    sub_questions = decompose_query(query, intent)
+
+    stats: Dict[str, float] = state.get("stats", {})
+    stats["classify"] = round(time.time() - t0, 2)
+
+    return {"intent": intent, "sub_questions": sub_questions, "stats": stats}
+
+
+async def _search_node(state: ResearchState) -> dict:
+    """Step 2: Concurrent subagent search (web + arxiv + mock fallback), using cache."""
+    t0 = time.time()
+    query = state["query"]
+    sub_questions: List[str] = state.get("sub_questions", [])
+    stats: Dict[str, float] = state.get("stats", {})
+
+    web = WebSubagent()
+    arxiv_sub = ArxivSubagent()
+    mock = MockSubagent()
+
+    from .cache import get_cached_citations, cache_citations
+
+    web_citations = get_cached_citations(f"__main__:{query}") or []
+    arxiv_citations: List[Citation] = []
+
+    if not web_citations:
+        web_citations, arxiv_citations = await asyncio.gather(
+            web.search(query),
+            arxiv_sub.search(query),
+        )
+        if web_citations:
+            cache_citations(f"__main__:{query}", web_citations)
+
+    mock_citations: List[Citation] = []
+    if not web_citations and not arxiv_citations:
+        mock_citations = await mock.search(query)
+
+    for sq in sub_questions[:3]:
+        cached = get_cached_citations(sq)
+        if cached:
+            web_citations.extend(cached)
+        else:
+            wc = await web.search(sq)
+            web_citations.extend(wc)
+            if wc:
+                cache_citations(sq, wc)
+
+    total_search = len(web_citations) + len(arxiv_citations) + len(mock_citations)
+    stats["search"] = round(time.time() - t0, 2)
+    stats["sources_found"] = total_search
+
+    return {
+        "citation_pool": web_citations + arxiv_citations + mock_citations,
+        "stats": stats,
+    }
+
+
+async def _fuse_node(state: ResearchState) -> dict:
+    """Step 3: RRF fusion + dedup by source_id prefix groups."""
+    t0 = time.time()
+    stats: Dict[str, float] = state.get("stats", {})
+    raw: List[Citation] = state.get("citation_pool", [])
+
+    # Partition into groups by source_id prefix for RRF
+    web_group = [c for c in raw if c.source_id.startswith("web:")]
+    arxiv_group = [c for c in raw if c.source_id.startswith(("arxiv:", "ss:"))]
+    mock_group = [c for c in raw if c.source_id.startswith("mock:")]
+
+    groups = [g for g in [web_group, arxiv_group, mock_group] if g]
+    if not groups:
+        groups = [raw]
+
+    citation_pool = rrf_fusion(groups)
+    stats["fuse"] = round(time.time() - t0, 2)
+    stats["citations_after_fusion"] = len(citation_pool)
+
+    return {"citation_pool": citation_pool, "stats": stats}
+
+
+async def _reflect_node(state: ResearchState) -> dict:
+    """Step 3.5: Review evidence for gaps, execute supplementary searches."""
+    t0 = time.time()
+    query = state["query"]
+    sub_questions: List[str] = state.get("sub_questions", [])
+    citation_pool: List[Citation] = state.get("citation_pool", [])
+    stats: Dict[str, float] = state.get("stats", {})
+
     seen_titles: set[str] = set()
     summary_lines: list[str] = []
     for c in citation_pool[:30]:
@@ -77,16 +175,16 @@ async def _reflect_and_search(
         )
         data = json.loads(response.choices[0].message.content or "{}")
     except Exception:
-        return citation_pool  # If reflection fails, proceed with what we have
+        stats["reflect"] = round(time.time() - t0, 2)
+        stats["citations_after_reflect"] = len(citation_pool)
+        return {"stats": stats}
 
-    if not data.get("gaps_found"):
-        return citation_pool
+    searches: list[str] = data.get("searches", [])
+    if not data.get("gaps_found") or not searches:
+        stats["reflect"] = round(time.time() - t0, 2)
+        stats["citations_after_reflect"] = len(citation_pool)
+        return {"stats": stats}
 
-    searches = data.get("searches", [])
-    if not searches:
-        return citation_pool
-
-    # Execute supplementary searches
     web = WebSubagent()
     new_citations: List[Citation] = []
     for sq in searches[:3]:
@@ -97,95 +195,92 @@ async def _reflect_and_search(
             continue
 
     if new_citations:
-        # Re-fuse: merge new into existing pool
-        return rrf_fusion([citation_pool, new_citations])
+        citation_pool = rrf_fusion([citation_pool, new_citations])
 
-    return citation_pool
-
-
-async def run_pipeline(query: str) -> ResearchReport:
-    """Execute the full deep research pipeline.
-
-    Flow: classify → decompose → search → fuse → reflect → synthesize → verify
-    """
-    start_time = time.time()
-    stats: Dict[str, float] = {}
-
-    # Step 1: Intent classification + query decomposition
-    t0 = time.time()
-    intent = classify_intent(query)
-    sub_questions = decompose_query(query, intent)
-    stats["classify"] = round(time.time() - t0, 2)
-
-    # Step 2: Concurrent subagent search (web + arxiv + mock fallback), using cache
-    t0 = time.time()
-    web = WebSubagent()
-    arxiv_sub = ArxivSubagent()
-    mock = MockSubagent()
-
-    from .cache import get_cached_citations, cache_citations
-
-    # Check cache for main query
-    web_citations = get_cached_citations(f"__main__:{query}") or []
-    arxiv_citations: List[Citation] = []
-
-    if not web_citations:
-        web_citations, arxiv_citations = await asyncio.gather(
-            web.search(query),
-            arxiv_sub.search(query),
-        )
-        if web_citations:
-            cache_citations(f"__main__:{query}", web_citations)
-
-    # Only enable mock when both web and arxiv fail (e.g. API blocked)
-    mock_citations: List[Citation] = []
-    if not web_citations and not arxiv_citations:
-        mock_citations = await mock.search(query)
-
-    # Also search sub-questions with web (arXiv rate-limits quickly), using cache
-    from .cache import get_cached_citations, cache_citations
-
-    for sq in sub_questions[:3]:
-        cached = get_cached_citations(sq)
-        if cached:
-            web_citations.extend(cached)
-        else:
-            wc = await web.search(sq)
-            web_citations.extend(wc)
-            if wc:
-                cache_citations(sq, wc)
-
-    total_search = len(web_citations) + len(arxiv_citations) + len(mock_citations)
-    stats["search"] = round(time.time() - t0, 2)
-    stats["sources_found"] = total_search
-
-    # Step 3: RRF fusion + dedup
-    t0 = time.time()
-    citation_pool = rrf_fusion([web_citations, arxiv_citations, mock_citations])
-    stats["fuse"] = round(time.time() - t0, 2)
-    stats["citations_after_fusion"] = len(citation_pool)
-
-    # Step 3.5: Reflection — check for information gaps and supplement
-    t0 = time.time()
-    citation_pool = await _reflect_and_search(query, sub_questions, citation_pool)
     stats["reflect"] = round(time.time() - t0, 2)
     stats["citations_after_reflect"] = len(citation_pool)
 
-    # Step 4: Synthesize report
+    return {"citation_pool": citation_pool, "stats": stats}
+
+
+async def _synthesize_node(state: ResearchState) -> dict:
+    """Step 4: Synthesize report from evidence pool."""
     t0 = time.time()
-    report = synthesize(query, intent, citation_pool, sub_questions)
+    stats: Dict[str, float] = state.get("stats", {})
+
+    report = synthesize(
+        query=state["query"],
+        intent=state.get("intent", "exploration"),
+        citation_pool=state.get("citation_pool", []),
+        sub_questions=state.get("sub_questions"),
+    )
+
+    if not report.sub_questions:
+        report.sub_questions = state.get("sub_questions", [])
+
     stats["synthesize"] = round(time.time() - t0, 2)
 
-    # Attach sub_questions to report (synthesizer may already set them, but ensure)
-    if not report.sub_questions:
-        report.sub_questions = sub_questions
+    return {"report": report, "stats": stats}
 
-    # Step 5: Verify (async)
+
+async def _verify_node(state: ResearchState) -> dict:
+    """Step 5: NLI verification (async, all claims)."""
     t0 = time.time()
-    report = await verify_report(report)
+    stats: Dict[str, float] = state.get("stats", {})
+
+    report = state.get("report")
+    if report is not None:
+        report = await verify_report(report)
+
     stats["verify"] = round(time.time() - t0, 2)
 
-    stats["total"] = round(time.time() - start_time, 2)
-    report.pipeline_stats = stats
-    report.elapsed_seconds = stats["total"]
+    return {"report": report, "stats": stats}
+
+
+# ── Graph construction (compiled once at module load) ────────────────────────
+
+_builder = StateGraph(ResearchState)
+
+_builder.add_node("classify", _classify_node)
+_builder.add_node("search", _search_node)
+_builder.add_node("fuse", _fuse_node)
+_builder.add_node("reflect", _reflect_node)
+_builder.add_node("synthesize", _synthesize_node)
+_builder.add_node("verify", _verify_node)
+
+_builder.add_edge(START, "classify")
+_builder.add_edge("classify", "search")
+_builder.add_edge("search", "fuse")
+_builder.add_edge("fuse", "reflect")
+_builder.add_edge("reflect", "synthesize")
+_builder.add_edge("synthesize", "verify")
+_builder.add_edge("verify", END)
+
+_compiled_graph = _builder.compile()
+
+
+def render_mermaid() -> str:
+    """Return the Mermaid diagram source for the compiled LangGraph pipeline."""
+    return _compiled_graph.get_graph().draw_mermaid()
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
+
+async def run_pipeline(query: str) -> ResearchReport:
+    """Execute the full deep research pipeline via LangGraph StateGraph.
+
+    Flow: classify → search → fuse → reflect → synthesize → verify
+    """
+    start_time = time.time()
+
+    result = await _compiled_graph.ainvoke({"query": query})
+
+    report = result.get("report")
+    stats: Dict[str, float] = result.get("stats", {})
+
+    if report is not None:
+        stats["total"] = round(time.time() - start_time, 2)
+        report.pipeline_stats = stats
+        report.elapsed_seconds = stats["total"]
+
     return report

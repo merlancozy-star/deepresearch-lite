@@ -7,4 +7,5 @@ pytest>=7.0
 httpx>=0.25
 beautifulsoup4>=4.12
 tenacity>=8.0
+langgraph>=0.2.0
 python-dotenv>=1.0
